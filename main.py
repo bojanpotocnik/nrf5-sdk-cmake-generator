@@ -12,6 +12,7 @@ Usage:
 """
 import io
 import os
+from pathlib import Path
 from typing import Optional, Dict, Union
 
 import pymake.pymake.parser
@@ -21,28 +22,38 @@ from pymake import pymake
 __author__ = "Bojan Potočnik"
 
 
-def cmake_set_variable(name: str, value: Union[Dict, str]) -> str:
+def create_file(cmake_version: str = "3.0.0") -> io.StringIO:
+    f = io.StringIO()
+    write_line(f, "# CMake file made by Nordic nRF5 SDK CMake Generator")
+    write_line(f, "# https://github.com/bojanpotocnik/nrf5-sdk-cmake-generator.git")
+    write_line(f, "cmake_minimum_required(VERSION {})".format(cmake_version))
+    write_line(f)
+    return f
+
+
+def cmake_set_variable(name: str, value: Union[Dict, str, Path],
+                       cache_path: Optional[str] = None, force: bool = False) -> str:
     if isinstance(value, dict):
         value = value[name]
-    return "set({} {})".format(name, value)
+    if isinstance(value, Path):
+        value = str(value.as_posix())
+    return "set({} {}{}{})".format(name, value,
+                                   ' CACHE PATH "{}"'.format(cache_path) if cache_path else "",
+                                   " FORCE" if force else "")
 
 
 def write_line(f: io.StringIO, line: Optional[str] = None):
     f.write((line or "") + "\n")
 
 
-def generate_cmake_for_makefile(makefile_path: str, print_ignored: bool = True) -> None:
+def generate_cmake_for_makefile(makefile_path: Path, print_ignored: bool = True) -> bool:
     with open(makefile_path, 'r') as f:
         makefile = f.read()
 
     # Performance improvement.
     # PROJECT_NAME is required variable in Makefiles of interest and this is much faster than parsing with pymake.
     if "PROJECT_NAME" not in makefile:
-        return
-
-    # if "gzll_nrf52_sd_resources_gcc" not in makefile:
-    #    # This is to process only few makefiles and then stop.
-    #    return
+        return False
 
     # Parse all Makefile statements
     makefile_statements: pymake.parserdata.StatementList = pymake.parser.parsestring(makefile, makefile_path)
@@ -75,14 +86,10 @@ def generate_cmake_for_makefile(makefile_path: str, print_ignored: bool = True) 
             print("Ignoring '{}'".format(makefile_path))
         else:
             print(".", end="", flush=True)
-        return
+        return False
     print("\nProcessing '{}'".format(makefile_path))
 
-    f = io.StringIO()
-    write_line(f, "# CMake file made with Nordic nRF5 SDK CMake Generator")
-    write_line(f, "# https://github.com/bojanpotocnik/nrf5-sdk-cmake-generator.git")
-    write_line(f, "cmake_minimum_required(VERSION 2.4.0)")
-    write_line(f)
+    f = create_file("2.4.0")
     write_line(f, cmake_set_variable("PROJECT_NAME", statements["PROJECT_NAME"].value))
     write_line(f)
     write_line(f, cmake_set_variable("TARGETS", statements["TARGETS"].value))
@@ -120,95 +127,123 @@ def generate_cmake_for_makefile(makefile_path: str, print_ignored: bool = True) 
     write_line(f)
     write_line(f, "project(${PROJECT_NAME})")
     write_line(f)
+    write_line(f, 'list(APPEND CFLAGS "-undef" "-D__GNUC__")')
+    write_line(f, "list(FILTER CFLAGS EXCLUDE REGEX mcpu)")
+    write_line(f, 'string(REPLACE ";" " " CFLAGS "${CFLAGS}")')
+    write_line(f, "set(CMAKE_C_FLAGS ${CFLAGS})")
+    write_line(f)
+    write_line(f, "include_directories(${INC_FOLDERS})")
+    write_line(f)
+    write_line(f, "add_executable(${PROJECT_NAME} ${SRC_FILES})")
     write_line(f)
 
-    s = ""
-    s += '\n'
-    s += 'project(${PROJECT_NAME})\n'
-    s += 'cmake_minimum_required(VERSION 2.4.0)\n'
-    s += 'project(${PROJECT_NAME})\n'
-    s += 'list(APPEND CFLAGS "-undef" "-D__GNUC__")\n'
-    s += 'list(FILTER CFLAGS EXCLUDE REGEX mcpu)\n'
-    s += 'string(REPLACE ";" " " CFLAGS "${CFLAGS}")\n'
-    s += 'set(CMAKE_C_FLAGS ${CFLAGS})\n'
-    s += 'include_directories(${INC_FOLDERS})\n'
-    s += 'add_executable(${PROJECT_NAME} ${SRC_FILES})\n'
-
+    # Replace string expansions from Make to CMake syntax.
     s: str = f.getvalue()
-    # Replace string expansions
-    s = s.replace("$(SDK_ROOT)", "${SDK_ROOT}")
-    s = s.replace("$(PROJ_DIR)", "${PROJ_DIR}")
-    s = s.replace("$(OPT)", "${OPT}")
-    s = s.replace("$(TEMPLATE_PATH)", "${TEMPLATE_PATH}")
-    s = s.replace("$(LINKER_SCRIPT)", "${LINKER_SCRIPT}")
+    for name in variable_names:
+        # When using str.format, "{{" and "}}" is used to print "{" and "}", that is why there are {{+{ below.
+        s = s.replace("$({})".format(name), "${{{}}}".format(name))
 
-    # print(s)
+    with open(makefile_path.parent.joinpath("CMakeLists.txt"), 'w') as cmake_f:
+        cmake_f.write(s)
 
-    return
-
-    print(makefile_statements)
-
-    s = ""
-    s += '\n'
-    s += 'project(${PROJECT_NAME})\n'
-    s += 'cmake_minimum_required(VERSION 2.4.0)\n'
-    s += 'project(${PROJECT_NAME})\n'
-    s += 'list(APPEND CFLAGS "-undef" "-D__GNUC__")\n'
-    s += 'list(FILTER CFLAGS EXCLUDE REGEX mcpu)\n'
-    s += 'string(REPLACE ";" " " CFLAGS "${CFLAGS}")\n'
-    s += 'set(CMAKE_C_FLAGS ${CFLAGS})\n'
-    s += 'include_directories(${INC_FOLDERS})\n'
-    s += 'add_executable(${PROJECT_NAME} ${SRC_FILES})\n'
+    return True
 
 
-def generate_cmake_for_examples(sdk_root: str) -> int:
-    print(sdk_root)
-    for dir_path, dir_names, filenames in os.walk(sdk_root):
+def generate_cmake_for_examples(sdk_root: Path) -> int:
+    f = create_file("2.8.9")
+    write_line(f, "# Configure toolchain")
+    write_line(f, "include(arm-gcc-toolchain.cmake)")
+    write_line(f)
+    # Go trough all makefiles in all of the SDK subdirectories.
+    for dir_path, dir_names, filenames in os.walk(str(sdk_root)):
+        dir_path = Path(dir_path)
         for filename in filenames:
             if filename == "Makefile":
-                generate_cmake_for_makefile(os.path.join(dir_path, filename))
+                if generate_cmake_for_makefile(dir_path.joinpath(filename)):
+                    write_line(f, "#add_subdirectory(./{})".format(dir_path.relative_to(sdk_root).as_posix()))
+    write_line(f)
 
-    """
-    tmp_makefile="/tmp/CMakeLists-generator.mk"
-
-    \cat << 'EOF' > ${tmp_makefile}
-    include Makefile
-    generate:
-    	$(foreach var, PROJECT_NAME SDK_ROOT PROJ_DIR SRC_FILES INC_FOLDERS CFLAGS CXXFLAGS, \
-    		echo "set($(var) $($(var)))" ; \
-    		echo ; \
-    	)
-    	@echo 'cmake_minimum_required(VERSION 2.4.0)'
-    	@echo 'project($$$ {PROJECT_NAME})'
-    	@echo 'list(APPEND CFLAGS "-undef" "-D__GNUC__")'
-    	@echo 'list(FILTER CFLAGS EXCLUDE REGEX mcpu)'
-    	@echo 'string(REPLACE ";" " " CFLAGS "$$$ {CFLAGS}")'
-    	@echo 'set(CMAKE_C_FLAGS $$$ {CFLAGS})'
-    	@echo 'include_directories($$$ {INC_FOLDERS})'
-    	@echo 'add_executable($$$ {PROJECT_NAME} $$$ {SRC_FILES})'
-    EOF
-    \echo "cmake_minimum_required(VERSION 2.8.9)" > CMakeLists.txt
-    for makefile in `\find ./examples -name Makefile` ; do
-        dir=`\dirname ${makefile}`
-        \echo "Creating CMakeLists.txt for ${makefile}"
-        \pushd ${dir} > /dev/null
-        \make -s -f ${tmp_makefile} generate > CMakeLists.txt
-        \popd > /dev/null
-        \echo "#add_subdirectory(${dir})" >> CMakeLists.txt
-    done
-    \rm ${tmp_makefile}
-    echo '************************************'
-    echo 'Enjoy using CLION with the NRF5-SDK!'
-    echo '************************************'
-    """
+    with open(sdk_root.joinpath("CMakeLists.txt"), 'w') as cmake_f:
+        cmake_f.write(f.getvalue())
 
     return 0
+
+
+def generate_common_cmakes(gcc_root: Path, gcc_prefix: str, gcc_extension: str, sdk_root: Path) -> None:
+    f = create_file("2.4.0")
+    write_line(f, "#")
+    write_line(f, "# GCC Compiler")
+    write_line(f, "#")
+    write_line(f, "# Path to the directory where GCC Compiler (*gcc*) is located, including trailing '/':")
+    write_line(f, cmake_set_variable("ARM_TOOLCHAIN_DIR", gcc_root.as_posix() + "/"))
+    write_line(f, "# Prefix and postfix (extension) to use when invoking GCC tools "
+                  "({prefix}gcc{extension}, {prefix}ld{extension}, ...):")
+    write_line(f, cmake_set_variable("ARM_TOOLCHAIN_PREFIX", gcc_prefix))
+    write_line(f, cmake_set_variable("ARM_TOOLCHAIN_EXTENSION", gcc_extension))
+    write_line(f)
+    write_line(f, "#")
+    write_line(f, "# nRF5 SDK")
+    write_line(f, "#")
+    write_line(f, cmake_set_variable("NRF5_SDK_ROOT", sdk_root.relative_to(sdk_root)))
+    write_line(f)
+
+    with open(sdk_root.joinpath("paths.cmake"), 'w') as cmake_f:
+        cmake_f.write(f.getvalue())
+
+    f = create_file("2.4.0")
+    write_line(f, "include(CMakeForceCompiler)")
+    write_line(f, cmake_set_variable("CMAKE_SYSTEM_NAME", "Generic"))
+    write_line(f, cmake_set_variable("CMAKE_SYSTEM_PROCESSOR", "ARM"))
+    write_line(f)
+    write_line(f, "# Include machine specific path configuration.")
+    write_line(f, "# Requires definition of:")
+    write_line(f, "#   ARM_TOOLCHAIN_DIR")
+    write_line(f, "#   ARM_TOOLCHAIN_PREFIX")
+    write_line(f, "include(paths.cmake)")
+    write_line(f)
+    write_line(f, "if (DEFINED PROJECT_NAME)")
+    write_line(f, '    message(FATAL_ERROR "Toolchain must be set before any language is set '
+                  '(i.e. before any project() or enable_language() command).")')
+    write_line(f, "endif ()")
+    write_line(f)
+    write_line(f, cmake_set_variable("CMAKE_C_COMPILER",
+                                     "${ARM_TOOLCHAIN_DIR}${ARM_TOOLCHAIN_PREFIX}gcc${ARM_TOOLCHAIN_EXTENSION}",
+                                     "C Compiler (gcc)", True))
+    write_line(f, cmake_set_variable("CMAKE_CXX_COMPILER",
+                                     "${ARM_TOOLCHAIN_DIR}${ARM_TOOLCHAIN_PREFIX}g++${ARM_TOOLCHAIN_EXTENSION}",
+                                     "C++ Compiler (g++)", True))
+    write_line(f, cmake_set_variable("CMAKE_ASM_COMPILER", "${CMAKE_C_COMPILER}",
+                                     "ASM Compiler (gcc)", True))
+    write_line(f, cmake_set_variable("CMAKE_OBJCOPY",
+                                     "${ARM_TOOLCHAIN_DIR}${ARM_TOOLCHAIN_PREFIX}objcopy${ARM_TOOLCHAIN_EXTENSION}",
+                                     "objcopy tool", True))
+    write_line(f, cmake_set_variable("CMAKE_OBJDUMP",
+                                     "${ARM_TOOLCHAIN_DIR}${ARM_TOOLCHAIN_PREFIX}objdump${ARM_TOOLCHAIN_EXTENSION}",
+                                     "objdump tool", True))
+    write_line(f, cmake_set_variable("CMAKE_SIZE_UTIL",
+                                     "${ARM_TOOLCHAIN_DIR}${ARM_TOOLCHAIN_PREFIX}size${ARM_TOOLCHAIN_EXTENSION}",
+                                     "size tool tool", True))
+    write_line(f)
+    write_line(f, "message(\"Using C compiler: '${CMAKE_C_COMPILER}'\")")
+    write_line(f, "message(\"Using C++ compiler: '${CMAKE_CXX_COMPILER}'\")")
+    write_line(f)
+    write_line(f)
+    write_line(f, "# Without that flag CMake is not able to pass test compilation check "
+                  "(only for successful compilation of CMake test)")
+    write_line(f, cmake_set_variable("CMAKE_EXE_LINKER_FLAGS_INIT", '"--specs=nosys.specs"'))
+    write_line(f)
+    # write_line(f, "# set(CMAKE_FIND_ROOT_PATH ${ARM_TOOLCHAIN_DIR})")
+    # write_line(f, "# set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)")
+    # write_line(f, "# set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)")
+    # write_line(f, "# set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)")
+
+    with open(sdk_root.joinpath("arm-gcc-toolchain.cmake"), 'w') as cmake_f:
+        cmake_f.write(f.getvalue())
 
 
 def main() -> int:
     import argparse
     import distutils.spawn
-    from pathlib import Path
 
     # Help user by detecting default values.
     sdk_root = os.environ.get("NRF5_SDK_ROOT") or os.environ.get("NRF52_SDK_ROOT") or os.environ.get("NRF_SDK_ROOT")
@@ -230,7 +265,7 @@ def main() -> int:
     parser.add_argument("--gcc", dest="GCC", type=str, nargs='+',
                         default=gcc, required=not bool(gcc),
                         help="Path to the GCC executable of the GNU ARM Embedded Toolchain. This path will "
-                             "also be used to find other tools (g++, objcopy, objdump, size)."
+                             "also be used to find other tools (g++, ld, objcopy, objdump, size)."
                              + (" (detected: {})".format(gcc) if gcc else ""))
     parser.add_argument("--prog", dest="NRFJPROG", type=str, nargs='+', default=nrfjprog,
                         help="Path to the nrfjprog executable (part of the nRF5x Command Line Tools provided "
@@ -248,7 +283,7 @@ def main() -> int:
     # args = parser.parse_args()
     # args = parser.parse_args(r'--sdk G:\Git\Dia-Vit\FW\nRF5_SDK --prog "C:\D ff\222 3\x.exe" -e'.split(" "))
     # args = parser.parse_args(r'--sdk G:\Git\Dia-Vit\FW\nRF5_SDK --prog "C:\f\2223\x.exe" -e'.split(" "))
-    args = parser.parse_args(r'--sdk G:\Git\Dia-Vit\FW\nRF5_SDK -e'.split(" "))
+    args = parser.parse_args(r'--sdk G:\Git\nRF5_SDK -e'.split(" "))
     args = vars(args)
 
     # endregion Parse arguments
@@ -267,7 +302,7 @@ def main() -> int:
     examples: bool = args["EXAMPLES"]
 
     # sdk_root shall be provided (handled by argparse).
-    sdk_root = Path(sdk_root)
+    sdk_root: Path = Path(sdk_root)
     if not (sdk_root.is_dir() and sdk_root.joinpath("components").is_dir() and sdk_root.joinpath("external").is_dir()):
         print("NRF5_SDK_ROOT shall be directory containing at least 'components' and 'external' subdirectories.")
         return -1
@@ -280,13 +315,14 @@ def main() -> int:
     gcc_root = gcc.parent
     # Build paths for other tools.
     gpp = gcc_root.joinpath(gcc_prefix + "g++" + gcc_extension)
+    ld = gcc_root.joinpath(gcc_prefix + "ld" + gcc_extension)
     objcopy = gcc_root.joinpath(gcc_prefix + "objcopy" + gcc_extension)
     objdump = gcc_root.joinpath(gcc_prefix + "objdump" + gcc_extension)
     size = gcc_root.joinpath(gcc_prefix + "size" + gcc_extension)
 
-    if not all(os.access(str(exe), os.X_OK) for exe in (gcc, gpp, objcopy, objdump, size)):
+    if not all(os.access(str(exe), os.X_OK) for exe in (gcc, gpp, ld, objcopy, objdump, size)):
         print("GCC shall be valid path to the GNU ARM Embedded Toolchain 'gcc' executable, next to which "
-              "shall also be located g++, objcopy, objdump and size tools with the same prefix and extension.")
+              "shall also be located g++, ld, objcopy, objdump and size tools with the same prefix and extension.")
         return -2
 
     # nrfjprog shall be valid if provided.
@@ -300,6 +336,8 @@ def main() -> int:
         return -4
 
     # endregion Check parameters
+
+    generate_common_cmakes(gcc_root, gcc_prefix, gcc_extension, sdk_root)
 
     if examples:
         generate_cmake_for_examples(sdk_root)
