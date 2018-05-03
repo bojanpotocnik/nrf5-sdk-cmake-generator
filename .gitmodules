@@ -1,0 +1,4 @@
+[submodule "pymake"]
+	path = pymake
+	branch = master
+	url = https://github.com/bojanpotocnik/pymake.git
