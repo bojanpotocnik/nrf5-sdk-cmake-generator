@@ -1,3 +1,6 @@
 /.idea/deployment.xml
 /.idea/misc.xml
 /.idea/workspace.xml
+
+# This file invokes main.py with different arguments for quick test on my machine
+bojan_test.py
